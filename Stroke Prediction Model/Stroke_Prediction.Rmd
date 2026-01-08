@@ -1,0 +1,351 @@
+---
+title: "Stroke Prediction"
+output: html_document
+author: Daphne O'Malley, Maxamed Jama, Zoe Cheng, Ashay Srivastava, Allen Liu, and Shemar Anglin 
+---
+```{r}
+# import libraries 
+library(tidyverse)
+library(fairmodels)
+library(DALEX)
+library(smotefamily)
+library(caret)
+library(e1071)
+library(kknn)
+library(pROC)
+library(tibble)
+library(ggplot2)
+library(kernlab)
+library(corrplot)
+```
+
+# 1. Data Preprocessing
+```{r}
+# import data
+data <- read.csv("healthcare-dataset-stroke-data.csv")
+
+# convert stroke column to factor with meaningful labels
+data$stroke <- factor(data$stroke, levels = c(0, 1), labels = c("no", "yes"))
+
+# check missing values and examine the dataset 
+colSums(is.na(data))
+summary(data)
+
+# convert "N/A" in BMI to NA and make numeric
+data$bmi <- as.numeric(ifelse(data$bmi == "N/A", NA, data$bmi))
+
+# impute missing BMI with median
+data$bmi[is.na(data$bmi)] <- median(data$bmi, na.rm = TRUE)
+
+# re-check missing values
+colSums(is.na(data))
+
+# encode categorical variables (one-hot)
+# define which columns contain categorical data
+cols_with_cat = c("gender","ever_married","work_type","Residence_type","smoking_status")
+
+# create df to store encoded data
+df_encoded <- data
+
+# loop through each categorical column
+for (col in cols_with_cat) {
+  # create one-hot encoded matrix for that column
+  encoded_column <- model.matrix(~ . - 1, data = df_encoded[col])
+  
+# add the new encoded columns to the dataset
+  df_encoded <- cbind(df_encoded, encoded_column)
+}
+
+# drop the original categorical columns
+df_encoded <- df_encoded[ , !(names(df_encoded) %in% cols_with_cat)]
+
+# preview processed data/ ready for Decision Tree
+head(df_encoded)
+```
+
+```{r}
+# normalize or standardize features for KNN & SVM
+cols_with_num = c("age","avg_glucose_level","bmi")
+
+# normalization for KNN
+df_normalized <- df_encoded %>%
+  mutate(across(all_of(cols_with_num), ~ (. - min(.)) / (max(.) - min(.))))
+
+head(df_normalized)
+
+# standardization for SVM
+df_standardized <- df_encoded %>%
+  mutate(across(all_of(cols_with_num), ~ (. - mean(.)) / sd(.)))
+
+head(df_standardized)
+```
+
+# 2. Data Visualization
+```{r}
+# create a boxplot
+ggplot(data, aes(x = stroke, y = avg_glucose_level, fill = stroke)) +
+  geom_boxplot() +
+  labs(title = "Boxplot: Relationship Between Glucose Levels and Stroke Outcome",
+       x = "Stroke", y = "Average Glucose Level") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# create a Proportional Bar Plot
+ggplot(data, aes(x = smoking_status, fill = stroke)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportional Bar Plot: Stroke Distribution Across Smoking Status Groups",
+       x = "Smoking Status", y = "Proportion") + 
+  scale_y_continuous(labels = scales::percent) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# create a Histogram
+ggplot(data, aes(x = age, fill = stroke)) +
+  geom_histogram(position = "identity", alpha = 0.6, binwidth = 5) +
+  labs(title = "Histogram: Distribution of Age by Stroke Outcome",
+       x = "Age (In Years)", y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# 3. Model Building
+```{r}
+# set seed for reproducibility
+set.seed(133)
+
+#  ensure that all column names are valid in R; standardize
+colnames(df_encoded) <- make.names(colnames(df_encoded))
+
+# stratified split: create training indices with 75% of data, preserving class distribution in Outcome
+train_index <- createDataPartition(df_encoded$stroke, p = 0.75, list = FALSE)
+test_index <- setdiff(1:nrow(data), train_index)
+
+# create training and testing subsets
+train_data <- df_encoded[train_index, ]
+test_data <- df_encoded[-train_index, ]
+
+# confirm the the stroke variable is a factor with the appropriate levels
+train_data$stroke <- factor(train_data$stroke, levels = c("no", "yes"))
+test_data$stroke <- factor(test_data$stroke, levels = c("no", "yes"))
+
+# set up cross-validation with 5 folds and configure ROC-based evaluation
+ctrl <- trainControl(method = "cv", number = 5,
+                     classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# train decision tree
+tree_model <- train(stroke ~ ., data = train_data, method = "rpart", trControl = ctrl, metric = "ROC")
+
+# train support vector machine (svm)
+svm_model <- train(
+  stroke ~ ., 
+  data = train_data, 
+  method = "svmRadial", 
+  trControl = ctrl, 
+  metric = "ROC", 
+  preProcess = c("center", "scale"),
+  tuneGrid = data.frame(C = 1, sigma = 0.1))
+
+# train knn
+model_knn <- train(stroke ~ ., 
+                   data = train_data,
+                   method = "kknn",
+                   trControl = ctrl,
+                   metric = "ROC")
+```
+
+# 4. Cross-Validation Model Evaluation
+```{r}
+# train decision tree
+model_tree <- train(stroke ~ ., data = train_data,
+                    method = "rpart",
+                    trControl = ctrl,
+                    metric = "ROC")
+
+# train support vector machine
+model_svm <- train(stroke ~ ., data = train_data,
+                   method = "svmRadial",
+                   trControl = ctrl,
+                   metric = "ROC")
+
+# train k-nearest neighbors
+model_knn <- train(stroke ~ ., data = train_data,
+                   method = "kknn",
+                   trControl = ctrl,
+                   metric = "ROC")
+
+
+# comparing all 3 models
+results <- resamples(list(DecisionTree = model_tree,
+                          SVM = model_svm,
+                          kNN = model_knn))
+
+summary(results)
+```
+
+# 5. Fairness and Bias Evaluation
+```{r}
+# Evaluate your models for potential bias or unfairness across subgroups
+
+# Step 1: Load & Pre-process
+# Use the encoded data set created earlier
+df <- df_encoded  # Already cleaned and encoded, so we just use this
+df$stroke <- factor(df$stroke, levels = c("no", "yes"), labels = c("No Stroke", "Stroke"))
+
+# check class distribution
+table(df$stroke)
+prop.table(table(df$stroke))  # Shows proportions
+# optional: quick bar plot
+ggplot(df, aes(x = stroke)) +
+  geom_bar(fill = "#2C3E50") +
+  labs(title = "Class Distribution of stroke Outcome",
+       x = "Stroke Outcome",
+       y = "Count") +
+  theme_minimal()
+
+# No need to train another decision tree model!!
+
+# convert for DALEX
+y_numeric <- ifelse(test_data$stroke == "yes", 1, 0)
+
+# Create explainer for fairmodels
+explainer_tree <- explain(
+  model = tree_model,
+  data = test_data %>% select(-stroke),
+  y = y_numeric,
+  label = "Decision Tree"
+)
+
+# Run fairness check for GENDER
+test_data$gender <- data$gender[test_index]
+fairness_object <- fairness_check(
+  explainer_tree,
+  protected = as.character(test_data$gender),
+  privileged = "Male"
+)
+
+# Plot and print fairness
+plot(fairness_object)
+print(fairness_object, colorize = FALSE)
+```
+
+
+```{r}
+# If bias is found, perform data processing steps to mitigate bias in the data. If bias is not found, be prepared to justify why mitigation steps are not needed.
+
+# APPLY SMOTE!! FOR THE STROKE DATASET
+# SMOTE needs 0/1 numeric for target
+train_data$stroke_numeric <- ifelse(train_data$stroke == "yes", 1, 0)
+
+# Apply SMOTE
+train_smote_result <- SMOTE(
+  X = train_data %>% select(-stroke, -stroke_numeric), 
+  target = train_data$stroke_numeric,  
+  K = 5,
+  dup_size = 1
+)
+# Create new training set
+train_smote <- cbind(
+  train_smote_result$data,
+  stroke = as.factor(ifelse(train_smote_result$data$class == 1, "yes", "no"))
+)
+# Remove temp class column
+train_smote$class <- NULL
+
+# RETRAIN the Decision Tree Model
+set.seed(133)
+model_tree_smote <- train(
+  stroke ~ ., 
+  data = train_smote,
+  method = "rpart",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+# Evaluate and check the fairness AGAIN!
+
+# Predict on the original
+tree_preds_smote <- predict(model_tree_smote, newdata = test_data)
+
+# Create numeric outcome
+y_numeric_smote <- ifelse(test_data$stroke == "yes", 1, 0)
+
+# Create explainer for fairness check
+explainer_tree_smote <- explain(
+  model = model_tree_smote,
+  data = test_data %>% select(-stroke),
+  y = y_numeric_smote,
+  label = "Decision Tree (SMOTE)"
+)
+
+# Reuse gender from before
+fairness_object_smote <- fairness_check(
+  explainer_tree_smote,
+  protected = test_data$gender,
+  privileged = "Male"
+)
+
+# PLOT THE RESULTS
+plot(fairness_object_smote)
+```
+
+# 6. Test Set Model Evaluation
+```{r}
+# compare model performance across all 3 models using the following metrics
+# define a function to compute evaluation metrics for a classification model
+evaluation_metrics <- function(model, test_data) {
+  
+  # generate predicted probabilities for the positive class ("yes" for stroke)
+  probs <- predict(model, newdata = test_data, type = "prob")
+  
+  # generate predicted class labels
+  preds <- predict(model, newdata = test_data)
+  
+  # compute the AUC for the positive class (stroke)
+  auc_val <- as.numeric(roc(response = test_data$stroke, predictor = probs$yes)$auc)
+  
+  # generate a confusion matrix comparing predictions to actual results
+  cm <- confusionMatrix(preds, test_data$stroke, positive = "yes")
+  
+  # return key evaluation metrics as a tidy tibble
+  tibble(
+    AUC = auc_val,                                  
+    Accuracy = cm$overall["Accuracy"],              
+    Sensitivity = cm$byClass["Sensitivity"],        
+    Specificity = cm$byClass["Specificity"]         
+  )
+}
+
+# define model list
+models <- list(Tree = model_tree, SVM = model_svm, kNN = model_knn)
+
+# put evaluation results into a tidy data frame
+results_list <- lapply(models, evaluation_metrics, test_data = test_data)
+
+# convert list to long-format data frame
+results_df <- bind_rows(results_list, .id = "Model") %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value")
+
+head(results_df)
+
+# compare differences in performance between the cross-validation and test results
+
+# create at least one visualization comparing test set model performances across the 3 models
+# plot with value labels
+ggplot(results_df, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = round(Value, 3)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.3, size = 3) +
+  labs(title = "Model Performance on Test Set",
+       y = "Score",
+       x = "Metric") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top")
+```
+
+
+
+
+
+
+
+
+
